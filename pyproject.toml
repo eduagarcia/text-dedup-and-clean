@@ -21,6 +21,7 @@ pyspark = "^3.3.1"
 regex = "^2023.5.5"
 urllib3 = "<=2.0"
 sphinxcontrib-bibtex = "^2.5.0"
+zstandard = "^0.21.0"
 ftfy = "^6.1.1"
 
 [tool.poetry.group.dev.dependencies]
@@ -42,5 +43,7 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
-max-line-length = 120
+line-length = 120
+
+[tool.ruff.isort]
 force-single-line = true

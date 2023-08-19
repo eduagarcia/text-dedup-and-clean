@@ -27,13 +27,16 @@ def add_io_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:  # 
     parser.add_argument("--cache_dir", type=str, help="`cache_dir` in load_dataset", default=".cache"),
     parser.add_argument("--revision", type=str, help="`revision` in load_dataset"),
     parser.add_argument(
-        "--use_auth_token", action=argparse.BooleanOptionalAction, help="`use_auth_token` in load_dataset"
+        "--use_auth_token", action=argparse.BooleanOptionalAction, help="To use auth token in load_dataset from HF Hub"
     ),
     parser.add_argument("--local", action=argparse.BooleanOptionalAction, help="Use local dataset", default=False),
     parser.add_argument("--num_workers", type=int, help="Number of workers", default=os.cpu_count()),
     parser.add_argument("--output", type=str, help="Path to deduplicated dataset output", required=True),
     parser.add_argument(
         "--debug", action=argparse.BooleanOptionalAction, help="Whether to run in debug mode", default=False
+    )
+    parser.add_argument(
+        "--clean_cache", action=argparse.BooleanOptionalAction, help="Whether to remove all cache files", default=True
     )
     return parser
 
@@ -61,7 +64,9 @@ def add_meta_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:  
     parser.add_argument(
         "--batch_size",
         type=int,
-        help="""Batch size to use for dataset iteration. Mainly for memory efficiency.""",
+        help="""Batch size to use for dataset iteration. Mainly for memory efficiency.
+        Single-threaded dedups like exacthash especially benefit from higher batches.
+        Batching process itself can take a lot of time. """,
         default=10000,
     ),
     return parser
@@ -110,6 +115,23 @@ def add_minhash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         default=None,
         help="Number of rows per band",
     )
+    parser.add_argument(
+        "--hash_func",
+        type=str,
+        choices=["sha1", "xxh3"],
+        default="sha1",
+        help="Hashing algorithm. Defaults to sha1. xxh3 is faster",
+    )
+    parser.add_argument(
+        "--hash_bits",
+        type=int,
+        choices=[16, 32, 64],
+        default=64,
+        help="""uint bit precision for hash. default is (np.uint)64.
+        However, even when using 64bit precision, only 32 bits are extracted from hash.
+        this is due to legacy reasons. refer to ekzhu/datasketch#212.
+        """,
+    ),
 
     return parser
 
@@ -134,11 +156,12 @@ def add_simhash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         default=3,
         help="""Ngram size to use in SimHash.""",
     )
-    parser.add_argument("--f", type=int, default=64, help="Simhash bit size"),
+    parser.add_argument("--f", type=int, default=64, choices=[64, 128], help="Simhash bit size"),
     parser.add_argument("--bit_diff", type=int, default=3, help="Bit difference to use in SimHash"),
     parser.add_argument(
         "--num_bucket", type=int, default=4, help="Number of buckets to use in SimHash, must be larger than bit_diff"
     ),
+
     return parser
 
 
@@ -193,7 +216,13 @@ def add_bloom_filter_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         Parser with added arguments.
     """
     parser.add_argument("--error_rate", type=float, default=1e-6, help="Error rate to use in BloomFilter"),
-    parser.add_argument("--hash_func", type=str, default="md5", help="Hash function to use in BloomFilter"),
+    parser.add_argument(
+        "--hash_func",
+        type=str,
+        choices=["md5", "sha256", "xxh3"],
+        default="md5",
+        help="Hash function to use in BloomFilter",
+    ),
     parser.add_argument("--initial_capacity", type=int, default=100, help="Initial capacity of BloomFilter"),
     return parser
 
@@ -212,7 +241,13 @@ def add_exact_hash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     parser : argparse.ArgumentParser
         Parser with added arguments.
     """
-    parser.add_argument("--hash_func", type=str, default="md5", help="Hash function to use in ExactHash"),
+    parser.add_argument(
+        "--hash_func",
+        type=str,
+        choices=["md5", "sha256", "xxh3"],
+        default="md5",
+        help="Hash function to use in ExactHash. defaults to md5",
+    ),
     return parser
 
 def add_fix_text_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:  # pragma: no cover

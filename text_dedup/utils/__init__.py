@@ -10,6 +10,8 @@ from text_dedup.utils.add_args import add_meta_args
 from text_dedup.utils.add_args import add_minhash_args
 from text_dedup.utils.add_args import add_sa_args
 from text_dedup.utils.add_args import add_simhash_args
+from text_dedup.utils.hashfunc import sha1_hash
+from text_dedup.utils.hashfunc import xxh3_hash
 from text_dedup.utils.add_args import add_fix_text_args
 from text_dedup.utils.timer import Timer
 from text_dedup.utils.tokenization import ngrams
@@ -28,5 +30,7 @@ __all__ = [
     "Timer",
     "ngrams",
     "UnionFind",
+    "sha1_hash",
+    "xxh3_hash",
     "load_dataset",
 ]

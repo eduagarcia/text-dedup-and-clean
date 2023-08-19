@@ -334,6 +334,12 @@ def optimal_param(
 
 # region: Quality Control
 def process_cluster(cluster: List[Any]) -> List[Any]:
+    cluster.sort(
+        key=lambda x: (
+            -x[-1] if x[-1] is not None else 0.0,
+            -x[-2] if x[-2] is not None else 0.0,
+        )
+    )
     return cluster[:1]
 
 
@@ -369,6 +375,7 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--b", type=int, default=None, help="Number of bands")
     parser.add_argument("--r", type=int, default=None, help="Number of rows per band")
     parser.add_argument("--column", "-c", type=str, default="content", help="Column to deduplicate on")
+    parser.add_argument("--repo_column", type=str, required=True, help="Code repo column")
     parser.add_argument("--index_column", type=str, default=None, help="Index column, will be assigned if not provided")
     parser.add_argument("--output", "-o", type=str, required=True, help="GCS output directory of parquet files")
     parser.add_argument("--output_index", "-oi", type=str, help="GCS output directory of index parquet files")
@@ -420,6 +427,7 @@ if __name__ == "__main__":  # pragma: no cover
         log.debug(f"{args.min_length=}")
         log.debug(f"{args.num_perm=}")
         log.debug(f"{args.column=}")
+        log.debug(f"{args.repo_column=}")
         log.debug(f"{args.index_column=}")
         for col, dtype in df.dtypes:
             log.debug(f"{col:<64}: {dtype}")
@@ -480,9 +488,8 @@ if __name__ == "__main__":  # pragma: no cover
 
     # region: Merge Results
     self_edges: pyspark.RDD = duplicate_edges.values().distinct().map(lambda x: (x, x)).cache()
-    all_edges: pyspark.RDD = duplicate_edges.union(self_edges).cache()
     df = df.join(
-        spark.createDataFrame(all_edges, schema=["__id__", "__component__"]),
+        spark.createDataFrame(duplicate_edges.union(self_edges), schema=["__id__", "__component__"]),
         on="__id__",
         how="left",
     ).cache()
@@ -495,21 +502,45 @@ if __name__ == "__main__":  # pragma: no cover
     self_edges.unpersist()
 
     # region: Quality Control: This section is hard-coded for The Stack
+    #
+    # A repo's quality is measured by, in order of importance:
+    #  1. The number of stars (higher is better)
+    #  2. The number of forks (higher is better)
+    #  3. TODO: The number of contributors (higher is better)
+    #
+    # A file's quality is therefore measured by the quality of its repo to prioritize
+    # the integrity of the repo so training context can be maximized at the repo level.
+
+    duplicates: pyspark.RDD = (
+        df.filter(F.col("__component__").isNotNull())
+        .select(
+            "__id__",
+            "__component__",
+            args.repo_column,
+            "max_stars_count",
+            "max_forks_count",
+        )
+        .rdd
+    ).cache()
 
     if args.debug:
-        NUM_DUPLICATE = all_edges.count()
-    cliques: pyspark.RDD = all_edges.groupBy(lambda x: x[1]).cache()
-    all_edges.unpersist()
+        NUM_DUPLICATE = duplicates.count()
+    cliques: pyspark.RDD = duplicates.groupBy(lambda x: x[1]).cache()
+    duplicates.unpersist()
+
+    # endregion
 
     if args.debug:
         cluster_id, _ = cliques.first()
         rows: List[Row] = df.filter(F.col("__component__") == cluster_id).head(5)
         log.debug("-" * 120)
         for i, record in enumerate(rows):
-            content = "\n".join(getattr(record, args.column).split("\n")[:10])
-            log.debug(f"{i}-th example:\n{content[:200]}\n")
+            content = "\n".join(record.content.split("\n")[:10])
+            log.debug(f"{i}-th example repo name: {record.max_stars_repo_name}")
+            log.debug(f"{i}-th example code:\n{content[:200]}\n")
             log.debug("-" * 120)
 
+    # region: Remove Low Quality Duplicates
     df = df.join(
         spark.createDataFrame(
             cliques.mapValues(lambda x: process_cluster(cluster=list(x))).flatMap(

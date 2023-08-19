@@ -7,21 +7,29 @@
 
 import argparse
 import os
-from hashlib import md5, sha256
-from typing import Any, Callable, Dict, List
+from typing import Any
+from typing import Callable
+from typing import Dict
+from typing import List
 
-from datasets import load_dataset
 import numpy as np
+from datasets import Dataset
+from datasets import load_dataset
 from tqdm import tqdm
 
 from text_dedup import logger
 from text_dedup.utils import add_exact_hash_args
 from text_dedup.utils import add_io_args
 from text_dedup.utils import add_meta_args
-from text_dedup.utils.timer import Timer
+from text_dedup.utils.hashfunc import md5_digest
+from text_dedup.utils.hashfunc import sha256_digest
+from text_dedup.utils.hashfunc import xxh3_64_digest
+from text_dedup.utils.hashfunc import xxh3_128_digest
 from text_dedup.utils.preprocess import normalize as normalize_for_dedup
+from text_dedup.utils.timer import Timer
 
-HASH_SIZE = np.uint64(0).nbytes # 8 bytes
+HASH_SIZE = np.uint64(0).nbytes  # 8 bytes
+
 
 def compute_hashes(batch: Dict[str, Any], idx: List[int], column: str, hash_func: Callable) -> Dict[str, Any]:
     """
@@ -37,7 +45,7 @@ def compute_hashes(batch: Dict[str, Any], idx: List[int], column: str, hash_func
         The column name of the text.
     hash_func : Callable
         The hash function to use.
-    
+
     Returns
     -------
     Dict[str, Any]
@@ -45,11 +53,12 @@ def compute_hashes(batch: Dict[str, Any], idx: List[int], column: str, hash_func
     """
     lines = batch[column][0].split("\n")
     n = len(lines)
-    hashes = [
-        hash_func(bytes(normalize_for_dedup(l), encoding="utf-8")).digest()[:HASH_SIZE]
-        for l in lines
-    ]
-    return {"__hash__": hashes, "__id__": [idx[0] for _ in range(n)], "__idx__": list(range(n))}
+    hashes = [hash_func(bytes(normalize_for_dedup(line), encoding="utf-8")) for line in lines]
+    return {
+        "__hash__": hashes,
+        "__id__": [idx[0] for _ in range(n)],
+        "__idx__": list(range(n)),
+    }
 
 
 def dedup(record: Dict[str, Any], idx: int, column: str, lookup: Dict) -> Dict[str, Any]:
@@ -66,7 +75,7 @@ def dedup(record: Dict[str, Any], idx: int, column: str, lookup: Dict) -> Dict[s
         The column name of the text.
     lookup : Dict
         A dictionary containing duplicated (example index, line index) pairs.
-    
+
     Returns
     -------
     Dict[str, Any]
@@ -81,8 +90,8 @@ def dedup(record: Dict[str, Any], idx: int, column: str, lookup: Dict) -> Dict[s
     record[column] = "\n".join(new_content)
     return record
 
-if __name__ == "__main__":  # pragma: no cover
 
+if __name__ == "__main__":  # pragma: no cover
     parser = argparse.ArgumentParser(
         prog="text_dedup.ccnet",
         description="Deduplicate line-level text using exact hashing",
@@ -97,7 +106,7 @@ if __name__ == "__main__":  # pragma: no cover
 
     with timer("Total"):
         with timer("Loading"):
-            ds = load_dataset(
+            ds: Dataset = load_dataset(  # type: ignore
                 path=args.path,
                 name=args.name,
                 data_dir=args.data_dir,
@@ -106,13 +115,26 @@ if __name__ == "__main__":  # pragma: no cover
                 revision=args.revision,
                 cache_dir=args.cache_dir,
                 use_auth_token=args.use_auth_token,
-                num_proc=args.num_workers,
+                num_proc=args.num_workers
             )
 
+        def md5_digest_sized(data: bytes) -> bytes:
+            return md5_digest(data)[:HASH_SIZE]
+
+        def sha256_digest_sized(data: bytes) -> bytes:
+            return sha256_digest(data)[:HASH_SIZE]
+
+        def xxh3_digest_sized(data: bytes) -> bytes:
+            return xxh3_128_digest(data)[:HASH_SIZE]
+
         hash_func = {
-            "md5": md5,
-            "sha256": sha256,
+            "md5": md5_digest,
+            "sha256": sha256_digest,
+            # xxh3 is much faster when used raw
+            "xxh3": xxh3_64_digest if HASH_SIZE == 8 else xxh3_digest_sized,
         }[args.hash_func]
+
+        LEN_DATASET = len(ds)
         hashes = set()
         remove = set()
 
@@ -125,17 +147,21 @@ if __name__ == "__main__":  # pragma: no cover
                 num_proc=args.num_workers,
                 fn_kwargs={"column": args.column, "hash_func": hash_func},
                 remove_columns=ds.column_names,
+                desc="Computing hashes...",
             )
 
-            for idx in tqdm(range(0, len(hashed), args.batch_size), desc="Processing..."):
-                batch = hashed[idx : idx + args.batch_size]
-                for h, id, idx in tqdm(zip(batch["__hash__"], batch["__id__"], batch["__idx__"]), leave=False):
+            NUM_SHARDS = int(np.ceil(len(hashed) / args.batch_size))
+            for batch_idx in tqdm(range(0, NUM_SHARDS), desc="Processing..."):
+                ds_shard = hashed.shard(NUM_SHARDS, batch_idx, contiguous=True)
+                for h, id_, idx in tqdm(
+                    zip(ds_shard["__hash__"], ds_shard["__id__"], ds_shard["__idx__"]),
+                    leave=False,
+                ):
                     if h in hashes:
-                        remove.add((id, idx))
+                        remove.add((id_, idx))
                         continue
                     hashes.add(h)
 
-    
         with timer("Filtering"):
             # TODO: remove might pose a memory bottleneck
             ds = ds.map(
@@ -143,15 +169,21 @@ if __name__ == "__main__":  # pragma: no cover
                 with_indices=True,
                 num_proc=args.num_workers,
                 fn_kwargs={"column": args.column, "lookup": remove},
+                desc="Deduping",
             )
-            ds = ds.filter(lambda x: len(x[args.column]) > 0, num_proc=args.num_workers)
+            ds = ds.filter(lambda x: len(x[args.column]) > 0, num_proc=args.num_workers, desc="Filtering 0 length docs")
 
         with timer("Saving"):
             ds.save_to_disk(args.output)
+
+        with timer("Cleaning"):
+            if args.clean_cache:
+                ds.cleanup_cache_files()
 
     PAD = 32
     for k, v in timer.elapsed_times.items():
         logger.info(f"{k:<{PAD}}: {v:.2f}s")
 
-    logger.info(f"{'Before':<{PAD}}: {len(hashed)}")
-    logger.info(f"{'After':<{PAD}}: {len(ds)}")
+    logger.info(f"{'Before document count':<{PAD}}: {LEN_DATASET}")
+    logger.info(f"{'Before line count':<{PAD}}: {len(hashed)}")
+    logger.info(f"{'After document count':<{PAD}}: {len(ds)}")
