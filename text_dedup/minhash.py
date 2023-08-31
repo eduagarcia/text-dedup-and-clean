@@ -11,7 +11,7 @@ import os
 import pickle
 import random
 import re
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -27,6 +27,7 @@ from text_dedup import logger
 from text_dedup.utils import UnionFind
 from text_dedup.utils import ngrams
 from text_dedup.utils import load_dataset
+from text_dedup.utils import deep_update
 from text_dedup.utils.add_args import add_io_args
 from text_dedup.utils.add_args import add_meta_args
 from text_dedup.utils.add_args import add_minhash_args
@@ -92,16 +93,7 @@ def embed_func(
     >>> hashranges = [(i, i + 25) for i in range(0, 250, 25)]
     >>> max_hash = np.uint32((1 << 32) - 1)
     >>> modulo_prime = np.uint32((1 << 32) - 5)
-    >>> PERMUTATIONS = np.array(
-    ...     [
-    ...         (
-    ...             RNG.randint(1, np.uint32((1 << 32) - 5), dtype=np.uint32),
-    ...             RNG.randint(0, np.uint32((1 << 32) - 5), dtype=np.uint32),
-    ...         )
-    ...         for _ in range(num_perm)
-    ...     ],
-    ...     dtype=np.uint32,
-    ... ).T
+    >>> PERMUTATIONS = (RNG.randint(1, modulo_prime, size=num_perm),RNG.randint(0, modulo_prime, size=num_perm))
     >>> res = embed_func(content, idx, num_perm=num_perm, ngram_size=ngram_size, min_length=0, hashranges=hashranges,
     ... permutations=PERMUTATIONS, hash_func=xxh3_32hash,dtype=np.uint32, max_hash=max_hash, modulo_prime=modulo_prime)
     >>> len(res["__signatures__"])
@@ -118,14 +110,11 @@ def embed_func(
         bytes(" ".join(t).lower(), "utf-8") for t in ngrams(NON_ALPHA.split(content), ngram_size, min_length)
     }
 
-    hashvalues: np.ndarray = np.array([hash_func(token) for token in tokens], dtype=dtype)
+    hashvalues: np.ndarray = np.array([hash_func(token) for token in tokens], dtype=dtype).reshape(len(tokens), 1)
     # Permute the hash values to produce new universal hashes
-    # Tile 'a' to match the shape of 'hashvalues' and Element-wise multiplication with 'hashvalues'
-    # Adding 'b' and taking the modulo 'Modulo_prime' and bitwise_AND with 'MAX_HASH' to keep only the necessary bits.
-    hashvalues = np.bitwise_and(
-        np.mod(np.add(np.multiply(hashvalues, np.tile(a, (len(hashvalues), 1)).T).T, b), modulo_prime),
-        max_hash,
-    )
+    # Element-wise multiplication with 'hashvalues' and a (non 0 random value) and then adding b
+    # Then, take modulo 'MODULO_PRIME' and bitwise_and with 'MAX_HASH' to keep only the necessary bits.
+    hashvalues = (hashvalues * a + b) % modulo_prime & max_hash
     # this part is where the name "min" of minhash comes from
     # this stacks all the hashes and then takes the minimum from each column
     masks: np.ndarray = np.full(shape=num_perm, dtype=dtype, fill_value=max_hash)
@@ -155,7 +144,7 @@ if __name__ == "__main__":  # pragma: no cover
     # why legacy implementations used mersenne primes for modulo:
     # https://en.wikipedia.org/wiki/Universal_hashing#Hashing_strings
     HASH_CONFIG: Dict[int, Tuple[type, Any, Any]] = {
-        64: (np.uint64, np.uint64((1 << 32) - 1), np.uint64((1 << 61) - 1)),
+        64: (np.uint64, np.uint32((1 << 32) - 1), np.uint64((1 << 61) - 1)),
         # 32, 16 bit config does not use a mersenne prime.
         # The original reason for using mersenne prime was speed.
         # Testing reveals, there is no benefit to using a 2^61 mersenne prime for division
@@ -183,6 +172,7 @@ if __name__ == "__main__":  # pragma: no cover
     mp.set_start_method("fork", force=True)
 
     uf = UnionFind()
+    cluster_sizes = Counter()
     timer = Timer()
 
     if args.b is not None and args.r is not None:
@@ -202,25 +192,20 @@ if __name__ == "__main__":  # pragma: no cover
     with timer("Total"):
         with timer("Loading"):
             ds = load_dataset(args)
-
+            original_length = len(ds)
 
         LEN_DATASET = len(ds)
+        cluster_to_min_idx_map = {}
         # for minhash, we need to make a lot of hashes(=num_perms).
         # In many previous implementations, this is achieved through a method described in
         # `Universal classes of hash functions` https://doi.org/10.1016/0022-0000(79)90044-8
         # There we start with a know good hash x (=hash_func) and permutate it as the following:
         # `new_hash = (a * x + b) mod prime mod max_hash` we need one a (!=0), b pair per new hash
         # the following produces these a, b pairs
-        PERMUTATIONS: np.ndarray = np.array(
-            [
-                (
-                    RNG.randint(1, MODULO_PRIME, dtype=DTYPE),  # a is a multiplier so should not be 0
-                    RNG.randint(0, MODULO_PRIME, dtype=DTYPE),  # b
-                )
-                for _ in range(args.num_perm)
-            ],
-            dtype=DTYPE,
-        ).T
+        PERMUTATIONS: Tuple[np.ndarray, np.ndarray] = (
+            RNG.randint(1, MODULO_PRIME, size=(args.num_perm,), dtype=DTYPE),  # a is a multiplier so should not be 0
+            RNG.randint(0, MODULO_PRIME, size=(args.num_perm,), dtype=DTYPE),  # b
+        )
 
         with timer("MinHashing"):
             embedded = ds.map(
@@ -257,7 +242,7 @@ if __name__ == "__main__":  # pragma: no cover
                 for key, Hs in zip(embedded_shard["__id__"], embedded_shard["__signatures__"]):
                     for i, H in enumerate(Hs):
                         HASH_TABLES[i][H].add(key)
-
+            
             for table in tqdm(HASH_TABLES, dynamic_ncols=True, desc="Clustering..."):
                 # cluster: Set[int]
                 for cluster in table.values():
@@ -266,13 +251,40 @@ if __name__ == "__main__":  # pragma: no cover
                     idx = min(cluster)
                     for x in cluster:
                         uf.union(x, idx)
-
-        with timer("Filtering"):
+            for idx in tqdm(range(len(ds)), total=len(ds), dynamic_ncols=True, desc="Counting..."):
+                cluster_id = uf.find(idx)
+                cluster_sizes[uf.find(idx)] += 1
+                if idx < cluster_id:
+                    if cluster_id not in cluster_to_min_idx_map:
+                        cluster_to_min_idx_map[cluster_id] = idx
+                    else:
+                        cluster_to_min_idx_map[cluster_id] = min(idx, cluster_to_min_idx_map[cluster_id])
+                
+        with timer("Mapping"):
             # gc manipulations to ensure that uf object is not unneccessarily copied across processes
             gc.freeze()
-            gc.disable()
+            gc.disable()    
+            def mapping(record, idx):
+                cluster_id = uf.find(idx)
+                cluster_size = cluster_sizes[cluster_id]
+                if cluster_id in cluster_to_min_idx_map:
+                    cluster_id = cluster_to_min_idx_map[cluster_id]
+                meta = {
+                    'meta': {
+                        'dedup': {
+                            'minhash': {
+                                'minhash_idx': idx,
+                                'cluster_main_idx': cluster_id,
+                                'cluster_size': cluster_size,
+                                'is_duplicate': cluster_id != idx
+                            }
+                        }
+                    }
+                }
+                return deep_update(record, meta)
+                
             ds = ds.map(
-                function=lambda _, idx: {"__cluster__": uf.find(idx)},
+                function=mapping,
                 with_indices=True,
                 num_proc=args.num_workers,
                 new_fingerprint=str(random.getrandbits(128)),
@@ -280,31 +292,44 @@ if __name__ == "__main__":  # pragma: no cover
             )
             gc.enable()
             gc.collect()
-            # This is where the deduplication happens
-            # Since there is no easy groupby in datasets
-            # I will use this simple filter for now
-            final_data = ds.filter(
-                function=lambda record, idx: record["__cluster__"] == idx,
-                with_indices=True,
-                num_proc=args.num_workers,
-                desc="Filtering clusters...",
-            )
 
+        if args.filter:
+            with timer("Filtering"):
+                # This is where the deduplication happens
+                # Since there is no easy groupby in datasets
+                # I will use this simple filter for now
+                ds_final = ds.filter(
+                    #function=lambda record: not record['meta']['dedup']["minhash"]['is_duplicate'],
+                    #TODO: REMOVE LATER
+                    function=lambda record: not record['meta']['dedup']["minhash"]['is_duplicate'] and not record['meta']['dedup']["exact_norm"]['is_duplicate'],
+                    num_proc=args.num_workers,
+                    desc="Filtering clusters..."
+                )
+                ds_final = ds_final.remove_columns(["meta"])
+        else:
+            ds_final = ds
+        
         with timer("Saving"):
-            final_data = final_data.remove_columns(["__cluster__"])
-            final_data.save_to_disk(args.output)
+            #final_data = final_data.remove_columns(["__cluster__"])
+            ds_final.save_to_disk(args.output)
+            if args.filter and args.save_both:
+                ds.save_to_disk(args.output+"_orig")
             if args.debug:
                 with open(os.path.join(args.output, "uf.pkl"), "wb") as f:
                     pickle.dump(uf, f, protocol=pickle.HIGHEST_PROTOCOL)
+                with open(os.path.join(args.output, "cluster_sizes.pkl"), "wb") as f:
+                    pickle.dump(cluster_sizes, f, protocol=pickle.HIGHEST_PROTOCOL)
+                with open(os.path.join(args.output, "cluster_to_min_idx_map.pkl"), "wb") as f:
+                    pickle.dump(cluster_to_min_idx_map, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         with timer("Cleaning"):
             if args.clean_cache:
                 ds.cleanup_cache_files()
-                final_data.cleanup_cache_files()
-
+                ds_final.cleanup_cache_files()
+                
     PAD = 32
     for k, v in timer.elapsed_times.items():
         logger.info(f"{k:<{PAD}}: {v:.2f}s")
 
-    logger.info(f"{'Before':<{PAD}}: {len(ds)}")
-    logger.info(f"{'After':<{PAD}}: {len(final_data)}")
+    logger.info(f"{'Before':<{PAD}}: {original_length}")
+    logger.info(f"{'After':<{PAD}}: {len(ds_final)}")
